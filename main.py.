@@ -4,3 +4,112 @@ import io
 import os
 import json
 import requests
+app = Flask(__name__)
+
+# Load the CSV data from memory (Render will read this file if you upload it)
+# For now, we embed the CSV content in the code for simplicity.
+# IN PRODUCTION: You would load this from a file or database.
+csv_content = """oem_number,sure_part_number,filter_type,thread,height_mm,diameter_mm,machine_make,machine_model
+1R-0709,SURE-OIL-101,Oil,M18x1.5,120,75,Caterpillar,320
+RP15001,SURE-FUEL-202,Fuel,M20x1.5,150,80,John Deere,7210
+971003002,SURE-HYD-303,Hydraulic,M16x1.0,100,60,Case IH,90"""
+
+def load_cross_ref():
+    """Parses the CSV string into a list of dictionaries."""
+    reader = csv.DictReader(io.StringIO(csv_content))
+    return list(reader)
+
+def get_groq_response(prompt):
+    """Sends the prompt to Groq AI and returns the JSON response."""
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY environment variable not set")
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "model": "llama-3.7-8b-instant"
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a SURE Filters cross-reference specialist. "
+                           "You are given a database of confirmed matches. "
+                           "If the input matches the database, return the JSON. "
+                           "If not, return 'No confirmed SURE equivalent'. "
+                           "You must ONLY use the data provided in the 'context'."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "response_format": {"type": "json_object"}
+    }
+    
+    response = requests.post(url, headers=headers, data=data)
+    response.raise_for_status()
+    return response.json()
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'GET':
+        return "Sure Filter Agent is running. POST data to /query to cross-reference."
+    
+    if request.method == 'POST':
+        # Get input data
+        input_number = request.json.get('input_number')
+        make = request.json.get('machine_make', '')
+        model = request.json.get('machine_model', '')
+        
+        if not input_number:
+            return jsonify({"error": "input_number is required"}), 400
+
+        # Load our data
+        db_records = load_cross_ref()
+        
+        # Filter for potential matches (Basic string match)
+        potential_matches = [record for record in db_records if input_number.lower() in record["oem_number"].lower()]
+        
+        if potential_matches:
+            # If we have matches, send them to AI for confirmation
+            context = f"Here are the confirmed records from our SURE catalog: {json.dumps(potential_matches)}"
+            prompt = f"""
+            Input: OEM Number: {input_number}, Make: {make}, Model: {model}
+            
+            {context}
+            
+            Task: 
+            1. Verify if the input_number matches the 'oem_number' field in the context.
+            2. Confirm the filter type, dimensions, and application.
+            3. Return the JSON object with: input_number, brand, filter_type, sure_part_number, confidence (high/medium/low), sources, notes.
+            4. If it's a perfect match, confidence is 'high'. If partial, 'medium' or 'low'.
+            """
+        else:
+            # If no exact match in DB, tell the AI to look for partial matches or return 'No confirmed'
+            prompt = f"""
+            Input: OEM Number: {input_number}, Make: {make}, Model: {model}
+            No exact match found in our primary cross-reference database.
+            Return: {{"input_number": "{input_number}", "brand": "Unknown", "filter_type": "Unknown", "sure_part_number": None, "confidence": "low", "sources": ["No DB Match"], "notes": "Manual review required: OEM number not in catalog."}}
+            """
+
+        # Call Groq
+        try:
+            groq_result = get_groq_response(prompt)
+            content = groq_result['choices'][0]['message']['content']
+            # Groq returns JSON as a string, so we parse it
+            return jsonify(json.loads(content))
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    return "OK"
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8000)))
+
